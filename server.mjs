@@ -23,7 +23,8 @@ const RECENT_COUNT = Number(process.env.RECENT_COUNT || 5)
 const SOURCE = String(argValue('--source') || process.env.SOURCE || 'db').toLowerCase()
 const DB_PATH = argValue('--db') || process.env.OPENCODE_DB || path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db')
 const POLL_MS = Number(process.env.DB_POLL_MS || 500)
-const IDLE_SECONDS = Number(process.env.IDLE_SECONDS || 12)
+const IDLE_GRACE_MS = Number(process.env.IDLE_GRACE_MS || 5000)
+const STALE_SECONDS = Number(process.env.STALE_SECONDS || 180)
 let activeSource = SOURCE
 
 const TOOL_ZONE = {
@@ -76,6 +77,8 @@ function upsertSession(info) {
       todos: 0,
       todosDone: 0,
       toolStatus: null,
+      idleAfter: null,
+      lastMessageID: null,
       lastActivity: 0,
     }
     workers.set(info.id, worker)
@@ -117,6 +120,7 @@ function applyToolPart(part) {
   if (!worker) worker = upsertSession({ id: part.sessionID, title: 'session' })
   if (!worker) return
   worker.lastActivity = Date.now()
+  worker.idleAfter = null
   worker.toolStatus = part.state?.status || null
   worker.tool = part.tool
   const input = part.state?.input || {}
@@ -236,6 +240,7 @@ function touchSession(id) {
   const worker = workers.get(id)
   if (!worker) return
   worker.lastActivity = Date.now()
+  worker.idleAfter = null
   markDirty()
 }
 
@@ -245,9 +250,18 @@ function idleSweep() {
   let changed = false
   for (const worker of workers.values()) {
     if (worker.state !== 'working') continue
+    if (worker.idleAfter && now >= worker.idleAfter) {
+      worker.state = 'idle'
+      worker.zone = 'breakroom'
+      worker.tool = null
+      worker.file = null
+      worker.toolStatus = null
+      worker.idleAfter = null
+      changed = true
+      continue
+    }
     const quiet = now - (worker.lastActivity || 0)
-    if (worker.toolStatus === 'running' && quiet < 120000) continue
-    if (quiet > IDLE_SECONDS * 1000) {
+    if (!worker.lastMessageID && quiet > STALE_SECONDS * 1000 && worker.toolStatus !== 'running') {
       worker.state = 'idle'
       worker.zone = 'breakroom'
       worker.tool = null
@@ -533,11 +547,71 @@ const DB_EVENT_SQL = `select rowid as rid, type,
   json_extract(data, '$.info.title') as infoTitle,
   json_extract(data, '$.info.directory') as infoDirectory,
   json_extract(data, '$.info.parentID') as infoParent,
-  json_extract(data, '$.info.time.updated') as infoUpdated
+  json_extract(data, '$.info.time.updated') as infoUpdated,
+  json_extract(data, '$.info.id') as infoMessageId,
+  json_extract(data, '$.info.role') as infoRole,
+  json_extract(data, '$.info.time.completed') as infoCompleted
 from event where rowid > ? order by rowid limit 500`
 
 const DB_SESSIONS_SQL = `select id, title, directory, parent_id, time_updated, cost,
   tokens_input, tokens_output, tokens_reasoning from session order by time_updated desc`
+
+const LAST_MESSAGE_SQL = `select id,
+  json_extract(data, '$.role') as role,
+  json_extract(data, '$.time.completed') as completed,
+  time_updated
+from message where session_id = ? order by time_created desc limit 1`
+
+const LAST_TOOL_SQL = `select json_extract(data, '$.tool') as tool,
+  json_extract(data, '$.state.status') as status,
+  json_extract(data, '$.state.input.filePath') as filePath,
+  json_extract(data, '$.state.input.path') as inputPath,
+  json_extract(data, '$.state.input.pattern') as pattern,
+  json_extract(data, '$.state.input.command') as command,
+  json_extract(data, '$.state.title') as title,
+  time_updated
+from part where session_id = ? and json_extract(data, '$.type') = 'tool'
+order by time_updated desc limit 1`
+
+function rebuildSessionState(db, id) {
+  const worker = workers.get(id)
+  if (!worker) return
+  let message
+  try {
+    message = db.prepare(LAST_MESSAGE_SQL).get(id)
+  } catch {
+    return
+  }
+  if (!message) return
+  worker.lastMessageID = message.id
+  if (message.role === 'assistant' && !message.completed) {
+    let tool
+    try {
+      tool = db.prepare(LAST_TOOL_SQL).get(id)
+    } catch {
+      tool = null
+    }
+    worker.state = 'working'
+    worker.idleAfter = null
+    if (tool && tool.tool) {
+      worker.tool = tool.tool
+      worker.toolStatus = tool.status || null
+      worker.zone = zoneForTool(tool.tool)
+      const raw = tool.filePath || tool.inputPath || tool.pattern || tool.title || tool.command
+      if (raw) {
+        const isPath = Boolean(tool.filePath || tool.inputPath)
+        worker.file = isPath ? baseName(raw) || short(raw, 20) : short(raw, 24)
+      }
+      worker.lastActivity = Math.max(worker.lastActivity || 0, tool.time_updated || 0)
+    } else if (worker.zone === 'breakroom') {
+      worker.zone = 'intake'
+    }
+    return
+  }
+  if (message.role === 'assistant' && message.completed) {
+    if (worker.state === 'working') worker.idleAfter = Date.now() + IDLE_GRACE_MS
+  }
+}
 
 function seedFromDb(db) {
   const rows = db.prepare(DB_SESSIONS_SQL).all()
@@ -551,9 +625,43 @@ function seedFromDb(db) {
     if (!worker) continue
     worker.tokens = (row.tokens_input || 0) + (row.tokens_output || 0) + (row.tokens_reasoning || 0)
     worker.cost = row.cost || 0
+    worker.lastActivity = Math.max(worker.lastActivity || 0, row.time_updated || 0)
+    rebuildSessionState(db, row.id)
     alive.add(row.id)
   }
   for (const id of [...workers.keys()]) if (!alive.has(id)) workers.delete(id)
+  markDirty()
+}
+
+function handleMessageUpdated(row) {
+  const sessionID = row.sessionID || row.infoId
+  if (!sessionID) return
+  const worker = workers.get(sessionID)
+  if (!worker) return
+  worker.lastActivity = Date.now()
+  if (row.infoRole === 'user') {
+    worker.idleAfter = null
+    if (worker.state !== 'working') {
+      worker.state = 'working'
+      worker.zone = worker.tool ? zoneForTool(worker.tool) : 'intake'
+    }
+    markDirty()
+    return
+  }
+  if (row.infoRole !== 'assistant') return
+  if (row.infoMessageId && row.infoMessageId !== worker.lastMessageID) {
+    worker.lastMessageID = row.infoMessageId
+    worker.idleAfter = null
+  }
+  if (row.infoCompleted && row.infoMessageId === worker.lastMessageID) {
+    worker.idleAfter = Date.now() + IDLE_GRACE_MS
+  } else {
+    worker.idleAfter = null
+    if (worker.state !== 'working') {
+      worker.state = 'working'
+      if (!worker.tool) worker.zone = 'intake'
+    }
+  }
   markDirty()
 }
 
@@ -570,6 +678,10 @@ function handleDbRow(row) {
       time: { updated: row.infoUpdated || undefined },
     })
     if (worker) promoteRecent(row.infoId)
+    return
+  }
+  if (type === 'message.updated') {
+    handleMessageUpdated(row)
     return
   }
   if (type !== 'message.part.updated' || !sessionID) return
@@ -714,7 +826,7 @@ setInterval(() => {
 setInterval(() => {
   reap()
   idleSweep()
-}, 2000)
+}, 1000)
 
 setInterval(() => {
   for (const res of clients) {
