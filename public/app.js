@@ -17,8 +17,20 @@ const STATE_COLOR = { working: '#58d68d', waiting: '#f4c542', error: '#ef5350', 
 const THEMES = [
   { id: 'factory', label: 'FACTORY' },
   { id: 'space', label: 'SPACE' },
+  { id: 'solar', label: 'SOLAR' },
+  { id: 'islands', label: 'ISLANDS' },
+  { id: 'rats', label: 'RATS' },
+  { id: 'soldiers', label: 'SOLDIERS' },
+  { id: 'aoe', label: 'AOE' },
 ]
-const HUD_H = 146
+const HUD_CONTENT_H = 108
+const THEME_COLS = 3
+const THEME_ROW_H = 30
+
+function hudHeight() {
+  return HUD_CONTENT_H + 6 + Math.ceil(THEMES.length / THEME_COLS) * THEME_ROW_H
+}
+
 const ROW_H = 36
 const LIST_PAD = 8
 const HEADER_H = 16
@@ -48,12 +60,22 @@ let heroButtons = {}
 let hoverFolder = null
 let hoverTheme = null
 let hoverRow = null
-let hudRect = { x: 20, y: 20, w: 330, h: HUD_H }
+let hudRect = { x: 20, y: 20, w: 330, h: hudHeight() }
 let stackRect = { x: 20, y: 0, w: 330, h: 0 }
 let heroRect = { x: 0, y: 0, w: 0, h: 0 }
 let focusId = null
+let lastSolarSize = ''
 let enabled = loadEnabled()
-let theme = typeof location !== 'undefined' && new URLSearchParams(location.search).get('theme') === 'space' ? 'space' : 'factory'
+const urlTheme = typeof location !== 'undefined' ? new URLSearchParams(location.search).get('theme') : null
+let theme = ['space', 'solar', 'islands', 'rats', 'soldiers', 'aoe'].includes(urlTheme) ? urlTheme : 'factory'
+
+function is3dTheme() {
+  return theme === 'solar' || theme === 'islands'
+}
+
+function threeApi() {
+  return typeof window !== 'undefined' && window.scene3d && !window.scene3d.failed ? window.scene3d : null
+}
 
 function setTheme(next) {
   theme = next
@@ -125,7 +147,7 @@ function computeRegions() {
   const wide = W >= WIDE_MIN
   const leftX = wide ? 20 : 10
   const leftW = wide ? 330 : Math.max(200, W - 20)
-  hudRect = { x: leftX, y: 20, w: leftW, h: HUD_H }
+  hudRect = { x: leftX, y: 20, w: leftW, h: hudHeight() }
   const maxRows = wide ? Math.max(1, Math.min(9, Math.floor((H - hudRect.y - hudRect.h - 40) / ROW_H))) : 4
   const rows = Math.min(stackWorkers().length, maxRows)
   const stackTop = hudRect.y + hudRect.h + 8
@@ -146,8 +168,17 @@ function computeRegions() {
 
 function layout() {
   computeRegions()
+  if (is3dTheme()) return
   if (theme === 'space' && typeof spaceLayout === 'function') {
     spaceLayout()
+    return
+  }
+  if (theme === 'rats' && typeof mazeLayout === 'function') {
+    mazeLayout()
+    return
+  }
+  if (theme === 'lems' && typeof lemLayout === 'function') {
+    lemLayout()
     return
   }
   const padX = 50
@@ -220,14 +251,31 @@ function syncWorkers(list) {
 }
 
 function update(dt, now) {
+  if (is3dTheme()) {
+    const api = threeApi()
+    if (api) api.update(dt, focusedWorker())
+    return
+  }
   if (theme === 'space' && typeof spaceUpdate === 'function') {
     spaceUpdate(dt, now)
+    return
+  }
+  if (theme === 'rats' && typeof mazeUpdate === 'function') {
+    mazeUpdate(dt, now)
+    return
+  }
+  if (theme === 'soldiers' && typeof soldierUpdate === 'function') {
+    soldierUpdate(dt, now)
+    return
+  }
+  if (theme === 'aoe' && typeof aoeUpdate === 'function') {
+    aoeUpdate(dt, now)
     return
   }
   const worker = focusedWorker()
   if (!worker) return
   const anchor = ZONES[worker.zone] || ZONES.breakroom
-  const target = iso(anchor.tx, anchor.ty)
+  const target = iso(anchor.tx + 0.55, anchor.ty + 0.55)
   const k = 1 - Math.exp(-6 * dt)
   if (!worker.placed) {
     worker.rx = target.x
@@ -256,8 +304,144 @@ function drawFloor() {
   }
 }
 
-function drawZones(worker) {
-  for (const zone of Object.values(ZONES)) {
+function shade(hex, amount) {
+  const raw = hex.replace('#', '')
+  const r = parseInt(raw.slice(0, 2), 16)
+  const g = parseInt(raw.slice(2, 4), 16)
+  const b = parseInt(raw.slice(4, 6), 16)
+  const mix = (value) => Math.max(0, Math.min(255, Math.round(value + 255 * amount)))
+  return `rgb(${mix(r)},${mix(g)},${mix(b)})`
+}
+
+function isoBox(tx, ty, tiles, heightPx, color, basePx = 0) {
+  const p = toScreen(iso(tx, ty))
+  const hw = (tiles * TW * scale) / 2
+  const hh = (tiles * TH * scale) / 2
+  const h = heightPx * scale
+  const baseY = p.y - basePx * scale
+
+  ctx.fillStyle = shade(color, 0.14)
+  ctx.beginPath()
+  ctx.moveTo(p.x, baseY - h - hh)
+  ctx.lineTo(p.x + hw, baseY - h)
+  ctx.lineTo(p.x, baseY - h + hh)
+  ctx.lineTo(p.x - hw, baseY - h)
+  ctx.closePath()
+  ctx.fill()
+
+  ctx.fillStyle = shade(color, -0.2)
+  ctx.beginPath()
+  ctx.moveTo(p.x - hw, baseY - h)
+  ctx.lineTo(p.x, baseY - h + hh)
+  ctx.lineTo(p.x, baseY + hh)
+  ctx.lineTo(p.x - hw, baseY)
+  ctx.closePath()
+  ctx.fill()
+
+  ctx.fillStyle = shade(color, -0.42)
+  ctx.beginPath()
+  ctx.moveTo(p.x + hw, baseY - h)
+  ctx.lineTo(p.x, baseY - h + hh)
+  ctx.lineTo(p.x, baseY + hh)
+  ctx.lineTo(p.x + hw, baseY)
+  ctx.closePath()
+  ctx.fill()
+
+  ctx.strokeStyle = 'rgba(0,0,0,0.35)'
+  ctx.lineWidth = 1
+  ctx.beginPath()
+  ctx.moveTo(p.x, baseY - h - hh)
+  ctx.lineTo(p.x + hw, baseY - h)
+  ctx.lineTo(p.x + hw, baseY)
+  ctx.lineTo(p.x, baseY + hh)
+  ctx.lineTo(p.x - hw, baseY)
+  ctx.lineTo(p.x - hw, baseY - h)
+  ctx.closePath()
+  ctx.stroke()
+}
+
+function drawFan(tx, ty, heightPx, now) {
+  const p = toScreen(iso(tx, ty))
+  const y = p.y - heightPx * scale
+  const r = 9 * Math.max(0.8, Math.min(scale, 2))
+  ctx.strokeStyle = 'rgba(180,200,225,0.55)'
+  ctx.lineWidth = 2
+  for (let i = 0; i < 3; i += 1) {
+    const a = now / 260 + (i * Math.PI * 2) / 3
+    ctx.beginPath()
+    ctx.moveTo(p.x, y)
+    ctx.lineTo(p.x + Math.cos(a) * r, y + Math.sin(a) * r * 0.45)
+    ctx.stroke()
+  }
+  ctx.fillStyle = 'rgba(200,215,235,0.7)'
+  ctx.beginPath()
+  ctx.arc(p.x, y, 2.5, 0, Math.PI * 2)
+  ctx.fill()
+}
+
+function drawZoneStructure(key, zone, now) {
+  const c = zone.color
+  const t = zone.tx
+  const y = zone.ty
+  if (key === 'archive') {
+    isoBox(t - 0.35, y - 0.3, 0.68, 30, c)
+    isoBox(t + 0.32, y - 0.28, 0.5, 20, c)
+    isoBox(t - 0.25, y + 0.34, 0.44, 13, c)
+  } else if (key === 'workbench') {
+    isoBox(t, y, 0.92, 7, c)
+    isoBox(t - 0.5, y - 0.35, 0.16, 18, c)
+    isoBox(t + 0.5, y + 0.35, 0.16, 18, c)
+    isoBox(t, y, 0.26, 5, c, 26)
+  } else if (key === 'machineshop') {
+    isoBox(t + 0.1, y + 0.1, 0.78, 22, c)
+    isoBox(t - 0.45, y - 0.45, 0.28, 42, c)
+    const p = toScreen(iso(t + 0.1, y + 0.1))
+    ctx.fillStyle = `rgba(255,170,60,${(0.25 + 0.2 * Math.sin(now / 260)).toFixed(2)})`
+    ctx.beginPath()
+    ctx.arc(p.x, p.y - 4 * scale, 7 * scale, 0, Math.PI * 2)
+    ctx.fill()
+  } else if (key === 'dock') {
+    isoBox(t, y, 0.95, 5, c)
+    isoBox(t - 0.22, y - 0.22, 0.42, 16, c)
+    isoBox(t + 0.3, y + 0.28, 0.38, 11, c)
+  } else if (key === 'supervisor') {
+    isoBox(t, y, 0.66, 46, c)
+    const p = toScreen(iso(t, y))
+    const blink = 0.3 + 0.7 * Math.max(0, Math.sin(now / 420))
+    ctx.fillStyle = `rgba(255,120,200,${blink.toFixed(2)})`
+    ctx.beginPath()
+    ctx.arc(p.x, p.y - 52 * scale, 3.5 * scale, 0, Math.PI * 2)
+    ctx.fill()
+  } else if (key === 'repair') {
+    isoBox(t, y, 0.82, 26, c)
+    const p = toScreen(iso(t, y))
+    const glow = 0.35 + 0.4 * Math.abs(Math.sin(now / 300))
+    ctx.fillStyle = `rgba(231,76,60,${glow.toFixed(2)})`
+    ctx.beginPath()
+    ctx.arc(p.x, p.y - 32 * scale, 5 * scale, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.strokeStyle = `rgba(231,76,60,${(glow * 0.5).toFixed(2)})`
+    ctx.lineWidth = 2
+    ctx.beginPath()
+    ctx.moveTo(p.x, p.y - 32 * scale)
+    ctx.lineTo(p.x + Math.cos(now / 180) * 22 * scale, p.y - 32 * scale + Math.sin(now / 180) * 10 * scale)
+    ctx.stroke()
+  } else if (key === 'intake') {
+    isoBox(t - 0.42, y, 0.24, 36, c)
+    isoBox(t + 0.42, y, 0.24, 36, c)
+    isoBox(t, y, 0.62, 7, c, 36)
+  } else if (key === 'breakroom') {
+    isoBox(t - 0.2, y - 0.18, 0.66, 10, c)
+    isoBox(t + 0.38, y + 0.12, 0.34, 8, c)
+    isoBox(t - 0.05, y + 0.45, 0.5, 3, c)
+    isoBox(t - 0.42, y - 0.42, 0.14, 18, c)
+    drawFan(t - 0.2, y - 0.18, 34, now)
+  }
+}
+
+function drawZones(worker, now) {
+  for (const key of Object.keys(ZONES)) {
+    const zone = ZONES[key]
     for (let dx = -1; dx <= 1; dx += 1) {
       for (let dy = -1; dy <= 1; dy += 1) {
         const tx = zone.tx + dx
@@ -272,19 +456,21 @@ function drawZones(worker) {
         void d
       }
     }
-    const active = worker && worker.zone === Object.keys(ZONES).find((key) => ZONES[key] === zone)
-    const d = diamond(iso(zone.tx, zone.ty), TW / 2 - 3, TH / 2 - 3)
-    ctx.fillStyle = active ? zone.color + '55' : zone.color + '22'
-    ctx.fill()
-    ctx.strokeStyle = active ? zone.color : zone.color + '88'
-    ctx.lineWidth = active ? 3 : 2
-    ctx.stroke()
+  }
 
-    ctx.font = '600 12px ui-monospace, Menlo, Consolas, monospace'
+  const ordered = Object.keys(ZONES).sort((a, b) => (ZONES[a].tx + ZONES[a].ty) - (ZONES[b].tx + ZONES[b].ty))
+  for (const key of ordered) drawZoneStructure(key, ZONES[key], now)
+
+  for (const key of Object.keys(ZONES)) {
+    const zone = ZONES[key]
+    const active = worker && worker.zone === key
+    const d = diamond(iso(zone.tx, zone.ty), TW / 2 - 3, TH / 2 - 3)
+    ctx.font = `${active ? '700 ' : '600 '}12px ui-monospace, Menlo, Consolas, monospace`
     ctx.textAlign = 'center'
     ctx.textBaseline = 'bottom'
     ctx.fillStyle = active ? zone.color : zone.color + 'cc'
     ctx.fillText(zone.label, d.x, d.y - d.hh - 8)
+    void d
   }
 }
 
@@ -292,7 +478,9 @@ function drawWorker(worker, now) {
   const point = toScreen({ x: worker.rx, y: worker.ry })
   const s = Math.max(1.1, Math.min(3.4, scale))
   const color = STATE_COLOR[worker.state] || STATE_COLOR.idle
-  const bob = worker.moving ? Math.sin(now / 90 + worker.phase * 6.28) * 2 * s : 0
+  const bob = worker.moving
+    ? Math.sin(now / 90 + worker.phase * 6.28) * 2 * s
+    : Math.sin(now / 620 + worker.phase * 6.28) * 1.4 * s
 
   ctx.fillStyle = 'rgba(0,0,0,0.35)'
   ctx.beginPath()
@@ -337,6 +525,19 @@ function drawWorker(worker, now) {
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
     ctx.fillText('!', point.x + 18 * s, headY - 17 * s)
+  }
+
+  if (worker.state === 'idle') {
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    for (let i = 0; i < 3; i += 1) {
+      const t = ((now / 1600 + i * 0.34 + worker.phase) % 1)
+      ctx.globalAlpha = (1 - t) * 0.75
+      ctx.fillStyle = worker.zone === 'breakroom' ? '#9ecbff' : '#8fa3bb'
+      ctx.font = `600 ${Math.round((9 + t * 9) * s)}px ui-monospace, Menlo, Consolas, monospace`
+      ctx.fillText('z', point.x + (16 + t * 12) * s, headY - (24 + t * 30) * s)
+    }
+    ctx.globalAlpha = 1
   }
 
   ctx.textAlign = 'center'
@@ -414,13 +615,18 @@ function drawHud(now) {
   ctx.fillText(`tokens ${formatTokens(stats.tokens)}   cost $${(stats.cost || 0).toFixed(3)}`, hudRect.x + 18, hudRect.y + 90)
 
   themeButtons = []
-  const buttonW = (hudRect.w - 36 - 8) / 2
-  const buttonY = hudRect.y + hudRect.h - 34
+  const themeCols = THEME_COLS
+  const themeGap = 8
+  const buttonW = (hudRect.w - 36 - themeGap * (themeCols - 1)) / themeCols
+  const buttonTop = hudRect.y + HUD_CONTENT_H + 4
   THEMES.forEach((item, index) => {
-    const bx = hudRect.x + 18 + index * (buttonW + 8)
+    const col = index % themeCols
+    const row = Math.floor(index / themeCols)
+    const bx = hudRect.x + 18 + col * (buttonW + themeGap)
+    const by = buttonTop + row * THEME_ROW_H
     const active = theme === item.id
     const hot = hoverTheme === item.id
-    rr(bx, buttonY, buttonW, 26, 6)
+    rr(bx, by, buttonW, 26, 6)
     ctx.fillStyle = active ? 'rgba(90,169,230,0.3)' : hot ? 'rgba(120,150,200,0.16)' : 'rgba(120,150,200,0.08)'
     ctx.fill()
     ctx.strokeStyle = active ? 'rgba(120,190,255,0.75)' : 'rgba(120,150,200,0.22)'
@@ -430,10 +636,10 @@ function drawHud(now) {
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
     ctx.fillStyle = active ? '#cfe6ff' : 'rgba(150,170,195,0.9)'
-    ctx.fillText(item.label, bx + buttonW / 2, buttonY + 13)
+    ctx.fillText(item.label, bx + buttonW / 2, by + 13)
     ctx.textAlign = 'left'
     ctx.textBaseline = 'middle'
-    themeButtons.push({ id: item.id, x: bx, y: buttonY, w: buttonW, h: 26 })
+    themeButtons.push({ id: item.id, x: bx, y: by, w: buttonW, h: 26 })
   })
   ctx.restore()
   void now
@@ -672,7 +878,7 @@ function drawFactoryHero(now) {
   ctx.fillStyle = gradient
   ctx.fillRect(heroRect.x, heroRect.y, heroRect.w, heroRect.h)
   drawFloor()
-  drawZones(worker)
+  drawZones(worker, now)
   if (worker) drawWorker(worker, now)
   drawLegend(worker)
   ctx.restore()
@@ -682,11 +888,60 @@ function drawFactoryHero(now) {
   ctx.stroke()
 }
 
+function drawHeroBorder() {
+  rr(heroRect.x, heroRect.y, heroRect.w, heroRect.h, 12)
+  ctx.strokeStyle = 'rgba(120,150,200,0.18)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+}
+
+function draw3dUnavailable() {
+  if (!workers.size) return
+  const cx = heroRect.x + heroRect.w / 2
+  const cy = heroRect.y + heroRect.h / 2
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillStyle = 'rgba(148,163,184,0.85)'
+  ctx.font = '600 20px ui-monospace, Menlo, Consolas, monospace'
+  ctx.fillText('3D unavailable on this device', cx, cy - 12)
+  ctx.fillStyle = 'rgba(107,122,143,0.85)'
+  ctx.font = '13px ui-monospace, Menlo, Consolas, monospace'
+  ctx.fillText('WebGL could not start - pick FACTORY or SPACE', cx, cy + 16)
+}
+
 function draw(now) {
   computeRegions()
-  drawBg()
-  if (theme === 'space' && typeof spaceDraw === 'function') spaceDraw(now)
-  else drawFactoryHero(now)
+  const api = threeApi()
+  const want3d = is3dTheme() && Boolean(api)
+  if (api) {
+    api.setTheme(theme)
+    const sizeKey = `${Math.round(heroRect.x)},${Math.round(heroRect.y)},${Math.round(heroRect.w)},${Math.round(heroRect.h)}`
+    if (sizeKey !== lastSolarSize) {
+      lastSolarSize = sizeKey
+      api.setSize(heroRect)
+    }
+    api.setActive(want3d)
+  }
+
+  if (is3dTheme()) {
+    if (want3d) {
+      ctx.clearRect(0, 0, W, H)
+      api.render()
+      drawHeroBorder()
+    } else {
+      drawBg()
+      drawHeroBorder()
+      draw3dUnavailable()
+    }
+  } else {
+    drawBg()
+    if (theme === 'space' && typeof spaceDraw === 'function') spaceDraw(now)
+    else if (theme === 'rats' && typeof mazeDraw === 'function') mazeDraw(now)
+    else if (theme === 'soldiers' && typeof soldierDraw === 'function') soldierDraw(now)
+    else if (theme === 'aoe' && typeof aoeDraw === 'function') aoeDraw(now)
+    else drawFactoryHero(now)
+  }
+
   drawHeroHeader(focusedWorker())
   drawHud(now)
   drawStack(now)
