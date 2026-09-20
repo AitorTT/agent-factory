@@ -36,13 +36,27 @@ let workers = new Map()
 let stats = { sessions: 0, working: 0, waiting: 0, error: 0, idle: 0, tokens: 0, cost: 0 }
 let upstream = 'starting'
 let upstreamHost = ''
-let source = ''
+let dataSource = ''
 let demo = false
 let connected = false
 let lastTargets = new Map()
 let recent = []
 let sessionRows = []
 let enabled = loadEnabled()
+let theme = typeof location !== 'undefined' && new URLSearchParams(location.search).get('theme') === 'space' ? 'space' : 'factory'
+
+function setTheme(next) {
+  theme = next
+  try {
+    const url = new URL(location.href)
+    if (next === 'factory') url.searchParams.delete('theme')
+    else url.searchParams.set('theme', next)
+    history.replaceState(null, '', url)
+  } catch {
+    /* ignore */
+  }
+  layout()
+}
 
 function loadEnabled() {
   try {
@@ -92,6 +106,10 @@ function iso(tx, ty) {
 }
 
 function layout() {
+  if (theme === 'space' && typeof spaceLayout === 'function') {
+    spaceLayout()
+    return
+  }
   const padX = 70
   const padTop = topPadding()
   const padBottom = 70
@@ -177,6 +195,10 @@ function syncWorkers(list) {
 }
 
 function update(dt, now) {
+  if (theme === 'space' && typeof spaceUpdate === 'function') {
+    spaceUpdate(dt, now)
+    return
+  }
   const targets = computeTargets()
   lastTargets = targets
   const k = 1 - Math.exp(-6 * dt)
@@ -337,7 +359,7 @@ function formatTokens(value) {
   return String(value)
 }
 
-function drawHud(now) {
+function drawHud(now, options = {}) {
   ctx.save()
   ctx.textAlign = 'left'
   ctx.textBaseline = 'middle'
@@ -362,7 +384,7 @@ function drawHud(now) {
 
   ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'
   ctx.fillStyle = '#8492a6'
-  const statusText = demo ? 'demo stream' : live ? `live · ${source || 'sse'}` : 'upstream offline'
+  const statusText = demo ? 'demo stream' : live ? `live · ${dataSource || 'sse'}` : 'upstream offline'
   ctx.fillText(statusText, HUD.x + 18, HUD.y + 46)
 
   ctx.font = '13px ui-monospace, Menlo, Consolas, monospace'
@@ -375,31 +397,30 @@ function drawHud(now) {
   ctx.fillStyle = '#7f8fa6'
   ctx.fillText(`tokens ${formatTokens(stats.tokens)}   cost $${(stats.cost || 0).toFixed(3)}`, HUD.x + 18, HUD.y + 90)
 
-  const legendY = H - 24 - Object.keys(ZONES).length * 0
-  void legendY
-
-  const zoneNames = Object.keys(ZONES)
-  const counts = new Map()
-  for (const worker of visibleWorkers()) counts.set(worker.zone, (counts.get(worker.zone) || 0) + 1)
-  const baseY = H - 30 - Math.ceil(zoneNames.length / 2) * 20
-  zoneNames.forEach((name, index) => {
-    const col = index % 2
-    const row = Math.floor(index / 2)
-    const x = 24 + col * 210
-    const y = baseY + row * 20
-    ctx.fillStyle = ZONES[name].color
-    ctx.fillRect(x, y - 5, 10, 10)
-    ctx.fillStyle = '#94a3b8'
-    ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'
-    ctx.fillText(`${ZONES[name].label}  ${counts.get(name) || 0}`, x + 18, y)
-  })
+  if (options.legend !== false) {
+    const zoneNames = Object.keys(ZONES)
+    const counts = new Map()
+    for (const worker of visibleWorkers()) counts.set(worker.zone, (counts.get(worker.zone) || 0) + 1)
+    const baseY = H - 30 - Math.ceil(zoneNames.length / 2) * 20
+    zoneNames.forEach((name, index) => {
+      const col = index % 2
+      const row = Math.floor(index / 2)
+      const x = 24 + col * 210
+      const y = baseY + row * 20
+      ctx.fillStyle = ZONES[name].color
+      ctx.fillRect(x, y - 5, 10, 10)
+      ctx.fillStyle = '#94a3b8'
+      ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'
+      ctx.fillText(`${ZONES[name].label}  ${counts.get(name) || 0}`, x + 18, y)
+    })
+  }
 
   if (!workers.size) {
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
     const fullHost = upstreamHost || 'http://127.0.0.1:4096'
     const bareHost = fullHost.replace(/^https?:\/\//, '')
-    const dbSource = source === 'db'
+    const dbSource = dataSource === 'db'
     const title = demo
       ? 'starting demo...'
       : upstream !== 'connected'
@@ -508,6 +529,10 @@ function drawSessionList() {
 }
 
 function draw(now) {
+  if (theme === 'space' && typeof spaceDraw === 'function') {
+    spaceDraw(now)
+    return
+  }
   const gradient = ctx.createLinearGradient(0, 0, 0, H)
   gradient.addColorStop(0, '#0d1220')
   gradient.addColorStop(1, '#080a10')
@@ -540,7 +565,7 @@ function connect() {
       if (message.type !== 'state') return
       upstream = message.upstream
       upstreamHost = message.host || ''
-      source = message.source || ''
+      dataSource = message.source || ''
       demo = message.demo
       stats = message.stats
       const nextRecent = message.recent || []
@@ -568,6 +593,7 @@ window.addEventListener('keydown', (event) => {
     if (!document.fullscreenElement) canvas.requestFullscreen?.()
     else document.exitFullscreen?.()
   }
+  if (event.key === 't' || event.key === 'T') setTheme(theme === 'space' ? 'factory' : 'space')
 })
 
 function handleClick(event) {
