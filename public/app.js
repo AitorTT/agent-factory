@@ -18,6 +18,10 @@ const SLOTS = [
   [-2, 0], [2, 0], [0, -2], [0, 2], [-2, -1], [2, 1],
 ]
 const STATE_COLOR = { working: '#58d68d', waiting: '#f4c542', error: '#ef5350', idle: '#8492a6' }
+const HUD = { x: 20, y: 20, w: 330, h: 108 }
+const ROW_H = 28
+const LIST_PAD = 8
+const HEADER_H = 16
 
 const canvas = document.getElementById('c')
 const ctx = canvas.getContext('2d')
@@ -31,9 +35,57 @@ let zoom = 1
 let workers = new Map()
 let stats = { sessions: 0, working: 0, waiting: 0, error: 0, idle: 0, tokens: 0, cost: 0 }
 let upstream = 'starting'
+let upstreamHost = ''
+let source = ''
 let demo = false
 let connected = false
 let lastTargets = new Map()
+let recent = []
+let sessionRows = []
+let enabled = loadEnabled()
+
+function loadEnabled() {
+  try {
+    return JSON.parse(window.localStorage.getItem('agent-factory:enabled') || '{}') || {}
+  } catch {
+    return {}
+  }
+}
+
+function isEnabled(id) {
+  return enabled[id] !== false
+}
+
+function toggleSession(id) {
+  enabled[id] = !isEnabled(id)
+  try {
+    window.localStorage.setItem('agent-factory:enabled', JSON.stringify(enabled))
+  } catch {
+    /* ignore storage failures */
+  }
+}
+
+function setEnabledFrom(list) {
+  for (const item of list) if (!(item.id in enabled)) enabled[item.id] = true
+}
+
+function visibleWorkers() {
+  const out = []
+  for (const worker of workers.values()) if (isEnabled(worker.id)) out.push(worker)
+  return out
+}
+
+function listHeight() {
+  return recent.length ? LIST_PAD * 2 + HEADER_H + recent.length * ROW_H : 0
+}
+
+function listTop() {
+  return HUD.y + HUD.h + 8
+}
+
+function topPadding() {
+  return listTop() + listHeight() + 24
+}
 
 function iso(tx, ty) {
   return { x: ((tx - ty) * TW) / 2, y: ((tx + ty) * TH) / 2 }
@@ -41,7 +93,7 @@ function iso(tx, ty) {
 
 function layout() {
   const padX = 70
-  const padTop = 150
+  const padTop = topPadding()
   const padBottom = 70
   const availW = Math.max(60, W - padX * 2)
   const availH = Math.max(60, H - padTop - padBottom)
@@ -96,7 +148,7 @@ function diamond(point, halfW, halfH) {
 
 function computeTargets() {
   const byZone = new Map()
-  for (const worker of workers.values()) {
+  for (const worker of visibleWorkers()) {
     if (!byZone.has(worker.zone)) byZone.set(worker.zone, [])
     byZone.get(worker.zone).push(worker.id)
   }
@@ -121,13 +173,14 @@ function syncWorkers(list) {
     workers.set(incoming.id, Object.assign({ rx: 0, ry: 0, placed: false }, previous || {}, incoming))
   }
   for (const id of [...workers.keys()]) if (!seen.has(id)) workers.delete(id)
+  setEnabledFrom(list)
 }
 
 function update(dt, now) {
   const targets = computeTargets()
   lastTargets = targets
   const k = 1 - Math.exp(-6 * dt)
-  for (const worker of workers.values()) {
+  for (const worker of visibleWorkers()) {
     const target = targets.get(worker.id)
     if (!target) continue
     if (!worker.placed) {
@@ -193,10 +246,10 @@ function drawLinks() {
   ctx.save()
   ctx.setLineDash([5, 6])
   ctx.lineWidth = 1.5
-  for (const worker of workers.values()) {
+  for (const worker of visibleWorkers()) {
     if (!worker.parentID) continue
     const parent = workers.get(worker.parentID)
-    if (!parent) continue
+    if (!parent || !isEnabled(parent.id)) continue
     const a = toScreen({ x: parent.rx, y: parent.ry })
     const b = toScreen({ x: worker.rx, y: worker.ry })
     ctx.strokeStyle = 'rgba(120,150,200,0.35)'
@@ -274,7 +327,7 @@ function drawWorker(worker, now) {
 }
 
 function drawWorkers(now) {
-  const list = [...workers.values()].sort((a, b) => a.ry - b.ry)
+  const list = visibleWorkers().sort((a, b) => a.ry - b.ry)
   for (const worker of list) drawWorker(worker, now)
 }
 
@@ -289,7 +342,7 @@ function drawHud(now) {
   ctx.textAlign = 'left'
   ctx.textBaseline = 'middle'
 
-  rr(20, 20, 316, 108, 12)
+  rr(HUD.x, HUD.y, HUD.w, HUD.h, 12)
   ctx.fillStyle = 'rgba(14,18,26,0.82)'
   ctx.fill()
   ctx.strokeStyle = 'rgba(120,150,200,0.18)'
@@ -298,36 +351,36 @@ function drawHud(now) {
 
   ctx.fillStyle = '#e6eef8'
   ctx.font = '700 18px ui-monospace, Menlo, Consolas, monospace'
-  ctx.fillText('HERMES FACTORY', 38, 44)
+  ctx.fillText('HERMES FACTORY', HUD.x + 18, HUD.y + 24)
 
   const live = upstream === 'connected'
   const dotColor = demo ? '#5aa9e6' : live ? '#58d68d' : '#ef5350'
   ctx.fillStyle = dotColor
   ctx.beginPath()
-  ctx.arc(292, 44, 5, 0, Math.PI * 2)
+  ctx.arc(HUD.x + HUD.w - 24, HUD.y + 24, 5, 0, Math.PI * 2)
   ctx.fill()
 
   ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'
   ctx.fillStyle = '#8492a6'
-  const statusText = demo ? 'demo stream' : live ? 'live' : 'upstream offline'
-  ctx.fillText(statusText, 38, 66)
+  const statusText = demo ? 'demo stream' : live ? `live · ${source || 'sse'}` : 'upstream offline'
+  ctx.fillText(statusText, HUD.x + 18, HUD.y + 46)
 
   ctx.font = '13px ui-monospace, Menlo, Consolas, monospace'
   ctx.fillStyle = '#cbd5e1'
   ctx.fillText(
     `agents ${stats.sessions}   working ${stats.working}   waiting ${stats.waiting}   error ${stats.error}`,
-    38,
-    90,
+    HUD.x + 18,
+    HUD.y + 70,
   )
   ctx.fillStyle = '#7f8fa6'
-  ctx.fillText(`tokens ${formatTokens(stats.tokens)}   cost $${(stats.cost || 0).toFixed(3)}`, 38, 110)
+  ctx.fillText(`tokens ${formatTokens(stats.tokens)}   cost $${(stats.cost || 0).toFixed(3)}`, HUD.x + 18, HUD.y + 90)
 
   const legendY = H - 24 - Object.keys(ZONES).length * 0
   void legendY
 
   const zoneNames = Object.keys(ZONES)
   const counts = new Map()
-  for (const worker of workers.values()) counts.set(worker.zone, (counts.get(worker.zone) || 0) + 1)
+  for (const worker of visibleWorkers()) counts.set(worker.zone, (counts.get(worker.zone) || 0) + 1)
   const baseY = H - 30 - Math.ceil(zoneNames.length / 2) * 20
   zoneNames.forEach((name, index) => {
     const col = index % 2
@@ -343,12 +396,115 @@ function drawHud(now) {
 
   if (!workers.size) {
     ctx.textAlign = 'center'
-    ctx.fillStyle = 'rgba(148,163,184,0.7)'
+    ctx.textBaseline = 'middle'
+    const fullHost = upstreamHost || 'http://127.0.0.1:4096'
+    const bareHost = fullHost.replace(/^https?:\/\//, '')
+    const dbSource = source === 'db'
+    const title = demo
+      ? 'starting demo...'
+      : upstream !== 'connected'
+        ? dbSource
+          ? 'cannot read opencode.db'
+          : `upstream unreachable: ${bareHost}`
+        : dbSource
+          ? 'no recent agent activity'
+          : `no active sessions on ${bareHost}`
+    ctx.fillStyle = 'rgba(148,163,184,0.8)'
     ctx.font = '600 20px ui-monospace, Menlo, Consolas, monospace'
-    ctx.fillText(demo ? 'starting demo...' : 'waiting for agent sessions...', W / 2, H / 2)
+    ctx.fillText(title, W / 2, H / 2 - 16)
+    if (!demo) {
+      ctx.fillStyle = 'rgba(120,150,200,0.9)'
+      ctx.font = '15px ui-monospace, Menlo, Consolas, monospace'
+      ctx.fillText(dbSource ? 'watching opencode.db for any agent activity' : `run:  opencode attach ${fullHost}`, W / 2, H / 2 + 18)
+      ctx.fillStyle = 'rgba(107,122,143,0.75)'
+      ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'
+      ctx.fillText(
+        dbSource ? 'start a session anywhere - desktop app, TUI, or server' : 'sessions must run against this server to appear here',
+        W / 2,
+        H / 2 + 44,
+      )
+    }
+  } else if (!visibleWorkers().length) {
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillStyle = 'rgba(148,163,184,0.75)'
+    ctx.font = '600 18px ui-monospace, Menlo, Consolas, monospace'
+    ctx.fillText('all sessions hidden', W / 2, H / 2 - 10)
+    ctx.fillStyle = 'rgba(107,122,143,0.75)'
+    ctx.font = '13px ui-monospace, Menlo, Consolas, monospace'
+    ctx.fillText('toggle a session on in the list at the top left', W / 2, H / 2 + 16)
   }
   ctx.restore()
   void now
+}
+
+function shortTitle(value, max) {
+  const text = String(value || '').trim()
+  return text.length > max ? `${text.slice(0, max - 1)}~` : text
+}
+
+function agoText(updated) {
+  if (!updated) return ''
+  const minutes = Math.max(0, Math.round((Date.now() - updated) / 60000))
+  if (minutes < 1) return 'now'
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return `${hours}h`
+  return `${Math.round(hours / 24)}d`
+}
+
+function drawSessionList() {
+  sessionRows = []
+  if (!recent.length) return
+  const x = HUD.x
+  const y = listTop()
+  const w = HUD.w
+  const h = listHeight()
+  rr(x, y, w, h, 12)
+  ctx.fillStyle = 'rgba(14,18,26,0.82)'
+  ctx.fill()
+  ctx.strokeStyle = 'rgba(120,150,200,0.18)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+
+  ctx.textAlign = 'left'
+  ctx.textBaseline = 'middle'
+  ctx.font = '600 10px ui-monospace, Menlo, Consolas, monospace'
+  ctx.fillStyle = 'rgba(120,150,200,0.7)'
+  ctx.fillText('RECENT SESSIONS', x + 14, y + LIST_PAD + HEADER_H / 2)
+
+  recent.forEach((session, index) => {
+    const rowY = y + LIST_PAD + HEADER_H + index * ROW_H
+    sessionRows.push({ id: session.id, x, y: rowY, w, h: ROW_H })
+    const on = isEnabled(session.id)
+    const cy = rowY + ROW_H / 2
+
+    rr(x + 14, cy - 7, 28, 14, 7)
+    ctx.fillStyle = on ? 'rgba(88,214,141,0.28)' : 'rgba(120,135,155,0.18)'
+    ctx.fill()
+    ctx.beginPath()
+    ctx.arc(on ? x + 35 : x + 21, cy, 8, 0, Math.PI * 2)
+    ctx.fillStyle = on ? '#58d68d' : '#7f8c9b'
+    ctx.fill()
+
+    ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'
+    ctx.fillStyle = on ? '#cbd5e1' : '#5f6b7c'
+    ctx.fillText(shortTitle(session.title || session.id.slice(-6), 28), x + 52, cy - 6)
+
+    ctx.font = '10px ui-monospace, Menlo, Consolas, monospace'
+    ctx.fillStyle = on ? 'rgba(132,146,166,0.95)' : 'rgba(95,107,124,0.8)'
+    ctx.fillText(shortTitle(session.dir || '—', 18), x + 52, cy + 8)
+
+    ctx.beginPath()
+    ctx.arc(x + w - 44, cy, 3, 0, Math.PI * 2)
+    ctx.fillStyle = STATE_COLOR[session.state] || STATE_COLOR.idle
+    ctx.fill()
+
+    ctx.textAlign = 'right'
+    ctx.fillStyle = on ? 'rgba(132,146,166,0.9)' : 'rgba(95,107,124,0.75)'
+    ctx.fillText(agoText(session.updated), x + w - 14, cy)
+    ctx.textAlign = 'left'
+  })
 }
 
 function draw(now) {
@@ -362,6 +518,7 @@ function draw(now) {
   drawLinks()
   drawWorkers(now)
   drawHud(now)
+  drawSessionList()
 }
 
 let last = performance.now()
@@ -382,8 +539,17 @@ function connect() {
       const message = JSON.parse(event.data)
       if (message.type !== 'state') return
       upstream = message.upstream
+      upstreamHost = message.host || ''
+      source = message.source || ''
       demo = message.demo
       stats = message.stats
+      const nextRecent = message.recent || []
+      if (nextRecent.length !== recent.length) {
+        recent = nextRecent
+        layout()
+      } else {
+        recent = nextRecent
+      }
       syncWorkers(message.workers)
     } catch {
       /* ignore malformed frames */
@@ -403,6 +569,20 @@ window.addEventListener('keydown', (event) => {
     else document.exitFullscreen?.()
   }
 })
+
+function handleClick(event) {
+  const rect = canvas.getBoundingClientRect()
+  const x = event.clientX - rect.left
+  const y = event.clientY - rect.top
+  for (const row of sessionRows) {
+    if (x >= row.x && x <= row.x + row.w && y >= row.y && y <= row.y + row.h) {
+      toggleSession(row.id)
+      return
+    }
+  }
+}
+
+canvas.addEventListener('click', handleClick)
 
 resize()
 connect()

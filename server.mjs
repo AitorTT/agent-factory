@@ -1,17 +1,30 @@
 import http from 'node:http'
+import os from 'node:os'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC = path.join(ROOT, 'public')
-const PORT = Number(process.env.PORT || 5100)
-const BIND = process.env.BIND || '127.0.0.1'
-const OPENCODE = (process.env.OPENCODE_HOST || 'http://127.0.0.1:4096').replace(/\/+$/, '')
+
+function argValue(flag) {
+  const index = process.argv.indexOf(flag)
+  return index >= 0 ? process.argv[index + 1] : undefined
+}
+
+const PORT = Number(argValue('--port') || process.env.PORT || 5100)
+const BIND = argValue('--bind') || process.env.BIND || '127.0.0.1'
+const OPENCODE = (argValue('--host') || process.env.OPENCODE_HOST || 'http://127.0.0.1:4096').replace(/\/+$/, '')
 const DEMO = process.argv.includes('--demo') || process.env.DEMO === '1'
 const TICK_MS = 100
 const WINDOW_MS = Number(process.env.ACTIVE_MINUTES || 15) * 60 * 1000
 const MAX_WORKERS = Number(process.env.MAX_WORKERS || 80)
+const RECENT_COUNT = Number(process.env.RECENT_COUNT || 5)
+const SOURCE = String(argValue('--source') || process.env.SOURCE || 'db').toLowerCase()
+const DB_PATH = argValue('--db') || process.env.OPENCODE_DB || path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db')
+const POLL_MS = Number(process.env.DB_POLL_MS || 500)
+const IDLE_SECONDS = Number(process.env.IDLE_SECONDS || 12)
+let activeSource = SOURCE
 
 const TOOL_ZONE = {
   read: 'archive', list: 'archive', glob: 'archive', grep: 'archive', codesearch: 'archive', lsp: 'archive',
@@ -38,8 +51,13 @@ const short = (value, max = 22) => {
 const workers = new Map()
 const creditedSteps = new Set()
 const clients = new Set()
+let recentIds = []
 let upstreamStatus = 'starting'
 let dirty = true
+
+function promoteRecent(id) {
+  recentIds = [id, ...recentIds.filter((value) => value !== id)].slice(0, RECENT_COUNT)
+}
 
 function upsertSession(info) {
   if (!info || !info.id) return null
@@ -57,6 +75,7 @@ function upsertSession(info) {
       note: null,
       todos: 0,
       todosDone: 0,
+      toolStatus: null,
       lastActivity: 0,
     }
     workers.set(info.id, worker)
@@ -98,10 +117,14 @@ function applyToolPart(part) {
   if (!worker) worker = upsertSession({ id: part.sessionID, title: 'session' })
   if (!worker) return
   worker.lastActivity = Date.now()
+  worker.toolStatus = part.state?.status || null
   worker.tool = part.tool
   const input = part.state?.input || {}
-  const named = input.filePath || input.path || input.pattern || part.state?.title
-  if (named) worker.file = baseName(named) || short(named, 18)
+  const raw = input.filePath || input.path || input.pattern || part.state?.title || input.command
+  if (raw) {
+    const isPath = Boolean(input.filePath || input.path)
+    worker.file = isPath ? baseName(raw) || short(raw, 20) : short(raw, 24)
+  }
   if (part.state?.status === 'error') {
     worker.state = 'error'
     worker.zone = 'repair'
@@ -130,11 +153,12 @@ function applyEvent(payload) {
   switch (payload.type) {
     case 'session.created':
     case 'session.updated':
-      upsertSession(properties.info)
+      if (upsertSession(properties.info)) promoteRecent(properties.info.id)
       break
     case 'session.deleted':
       if (properties.info?.id) {
         workers.delete(properties.info.id)
+        recentIds = recentIds.filter((id) => id !== properties.info.id)
         markDirty()
       }
       break
@@ -208,6 +232,33 @@ function applyEvent(payload) {
   }
 }
 
+function touchSession(id) {
+  const worker = workers.get(id)
+  if (!worker) return
+  worker.lastActivity = Date.now()
+  markDirty()
+}
+
+function idleSweep() {
+  if (activeSource !== 'db') return
+  const now = Date.now()
+  let changed = false
+  for (const worker of workers.values()) {
+    if (worker.state !== 'working') continue
+    const quiet = now - (worker.lastActivity || 0)
+    if (worker.toolStatus === 'running' && quiet < 120000) continue
+    if (quiet > IDLE_SECONDS * 1000) {
+      worker.state = 'idle'
+      worker.zone = 'breakroom'
+      worker.tool = null
+      worker.file = null
+      worker.toolStatus = null
+      changed = true
+    }
+  }
+  if (changed) markDirty()
+}
+
 function computeStats() {
   const result = { sessions: workers.size, working: 0, waiting: 0, error: 0, idle: 0, tokens: 0, cost: 0 }
   for (const worker of workers.values()) {
@@ -226,7 +277,17 @@ function snapshot() {
     type: 'state',
     now: Date.now(),
     upstream: upstreamStatus,
+    host: OPENCODE,
+    source: activeSource,
     demo: DEMO,
+    recent: recentIds
+      .map((id) => {
+        const worker = workers.get(id)
+        return worker
+          ? { id: worker.id, title: worker.title || '', dir: worker.dir || '', zone: worker.zone, state: worker.state, updated: worker.lastActivity || 0 }
+          : null
+      })
+      .filter(Boolean),
     workers: [...workers.values()].map((worker) => ({
       id: worker.id,
       title: worker.title || '',
@@ -268,12 +329,14 @@ async function reconcile() {
     if (!Array.isArray(sessions)) throw new Error('unexpected session list')
     const statusMap = statusRes.ok ? ((await statusRes.json()) || {}) : {}
     const now = Date.now()
-    const alive = new Set()
-    for (const session of sessions) {
+    const sorted = [...sessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0))
+    recentIds = sorted.slice(0, RECENT_COUNT).map((session) => session.id)
+    const alive = new Set(recentIds)
+    for (const session of sorted) {
       const status = statusMap[session.id]
       const active = status && status.type !== 'idle'
       const recent = (session.time?.updated || 0) > now - WINDOW_MS
-      if (!active && !recent) continue
+      if (!active && !recent && !alive.has(session.id)) continue
       if (upsertSession(session)) alive.add(session.id)
     }
     for (const id of [...workers.keys()]) if (!alive.has(id)) workers.delete(id)
@@ -451,18 +514,189 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
+const DB_EVENT_SQL = `select rowid as rid, type,
+  json_extract(data, '$.sessionID') as sessionID,
+  json_extract(data, '$.part.id') as partId,
+  json_extract(data, '$.part.type') as partType,
+  json_extract(data, '$.part.tool') as tool,
+  json_extract(data, '$.part.state.status') as status,
+  json_extract(data, '$.part.state.title') as title,
+  json_extract(data, '$.part.state.input.filePath') as filePath,
+  json_extract(data, '$.part.state.input.path') as inputPath,
+  json_extract(data, '$.part.state.input.pattern') as pattern,
+  json_extract(data, '$.part.state.input.command') as command,
+  json_extract(data, '$.part.cost') as cost,
+  json_extract(data, '$.part.tokens.input') as tokIn,
+  json_extract(data, '$.part.tokens.output') as tokOut,
+  json_extract(data, '$.part.tokens.reasoning') as tokReason,
+  json_extract(data, '$.info.id') as infoId,
+  json_extract(data, '$.info.title') as infoTitle,
+  json_extract(data, '$.info.directory') as infoDirectory,
+  json_extract(data, '$.info.parentID') as infoParent,
+  json_extract(data, '$.info.time.updated') as infoUpdated
+from event where rowid > ? order by rowid limit 500`
+
+const DB_SESSIONS_SQL = `select id, title, directory, parent_id, time_updated, cost,
+  tokens_input, tokens_output, tokens_reasoning from session order by time_updated desc`
+
+function seedFromDb(db) {
+  const rows = db.prepare(DB_SESSIONS_SQL).all()
+  const now = Date.now()
+  recentIds = rows.slice(0, RECENT_COUNT).map((row) => row.id)
+  const alive = new Set(recentIds)
+  for (const row of rows) {
+    const recent = (row.time_updated || 0) > now - WINDOW_MS
+    if (!recent && !alive.has(row.id)) continue
+    const worker = upsertSession({ id: row.id, title: row.title, directory: row.directory, parentID: row.parent_id, time: { updated: row.time_updated } })
+    if (!worker) continue
+    worker.tokens = (row.tokens_input || 0) + (row.tokens_output || 0) + (row.tokens_reasoning || 0)
+    worker.cost = row.cost || 0
+    alive.add(row.id)
+  }
+  for (const id of [...workers.keys()]) if (!alive.has(id)) workers.delete(id)
+  markDirty()
+}
+
+function handleDbRow(row) {
+  const type = String(row.type || '').replace(/\.\d+$/, '')
+  const sessionID = row.sessionID || row.infoId
+  if (type === 'session.created' || type === 'session.updated') {
+    if (!row.infoId) return
+    const worker = upsertSession({
+      id: row.infoId,
+      title: row.infoTitle,
+      directory: row.infoDirectory,
+      parentID: row.infoParent,
+      time: { updated: row.infoUpdated || undefined },
+    })
+    if (worker) promoteRecent(row.infoId)
+    return
+  }
+  if (type !== 'message.part.updated' || !sessionID) return
+  if (workers.has(sessionID)) touchSession(sessionID)
+  if (row.partType === 'tool') {
+    applyToolPart({
+      id: row.partId,
+      sessionID,
+      type: 'tool',
+      tool: row.tool,
+      state: {
+        status: row.status,
+        input: { filePath: row.filePath || undefined, path: row.inputPath || undefined, pattern: row.pattern || undefined, command: row.command || undefined },
+        title: row.title || undefined,
+      },
+    })
+  } else if (row.partType === 'step-finish') {
+    applyStepPart({
+      id: row.partId,
+      sessionID,
+      type: 'step-finish',
+      cost: row.cost || 0,
+      tokens: { input: row.tokIn || 0, output: row.tokOut || 0, reasoning: row.tokReason || 0 },
+    })
+  }
+}
+
+let dbLastRowid = 0
+
+function pollDb(db) {
+  const rows = db.prepare(DB_EVENT_SQL).all(dbLastRowid)
+  if (!rows.length) {
+    if (upstreamStatus !== 'connected') {
+      upstreamStatus = 'connected'
+      markDirty()
+    }
+    return
+  }
+  for (const row of rows) {
+    dbLastRowid = row.rid
+    try {
+      handleDbRow(row)
+    } catch {
+      /* ignore a malformed row */
+    }
+  }
+  if (upstreamStatus !== 'connected') upstreamStatus = 'connected'
+  markDirty()
+}
+
+async function startDbSource() {
+  let DatabaseSync
+  try {
+    ({ DatabaseSync } = await import('node:sqlite'))
+  } catch {
+    console.warn('node:sqlite unavailable - falling back to SSE source')
+    activeSource = 'sse'
+    return upstreamLoop()
+  }
+
+  let db
+  try {
+    db = new DatabaseSync(DB_PATH, { readOnly: true })
+    db.prepare('select count(*) as n from event').get()
+  } catch (error) {
+    console.warn(`cannot read ${DB_PATH} (${error.message}) - falling back to SSE source`)
+    activeSource = 'sse'
+    return upstreamLoop()
+  }
+
+  console.log(`source: db (${DB_PATH})`)
+  upstreamStatus = 'connected'
+  try {
+    seedFromDb(db)
+  } catch {
+    /* ignore seed failures */
+  }
+  try {
+    dbLastRowid = db.prepare('select coalesce(max(rowid), 0) as n from event').get().n
+  } catch {
+    dbLastRowid = 0
+  }
+  markDirty()
+
+  setInterval(() => {
+    try {
+      pollDb(db)
+    } catch {
+      upstreamStatus = 'offline'
+      markDirty()
+      try {
+        db.close()
+      } catch {
+        /* ignore */
+      }
+      try {
+        db = new DatabaseSync(DB_PATH, { readOnly: true })
+      } catch {
+        /* retry on next tick */
+      }
+    }
+  }, POLL_MS)
+
+  setInterval(() => {
+    try {
+      seedFromDb(db)
+    } catch {
+      /* ignore */
+    }
+  }, 15000)
+}
+
 function reap() {
   const now = Date.now()
   let changed = false
   for (const [id, worker] of [...workers.entries()]) {
+    if (recentIds.includes(id)) continue
     if (worker.state === 'idle' && now - (worker.lastActivity || 0) > WINDOW_MS) {
       workers.delete(id)
       changed = true
     }
   }
   if (workers.size > MAX_WORKERS) {
-    const sorted = [...workers.entries()].sort((a, b) => (b[1].lastActivity || 0) - (a[1].lastActivity || 0))
-    for (const [id] of sorted.slice(MAX_WORKERS)) {
+    const sorted = [...workers.entries()]
+      .filter(([id]) => !recentIds.includes(id))
+      .sort((a, b) => (b[1].lastActivity || 0) - (a[1].lastActivity || 0))
+    for (const [id] of sorted.slice(Math.max(0, MAX_WORKERS - recentIds.length))) {
       workers.delete(id)
       changed = true
     }
@@ -477,7 +711,10 @@ setInterval(() => {
   }
 }, TICK_MS)
 
-setInterval(reap, 5000)
+setInterval(() => {
+  reap()
+  idleSweep()
+}, 2000)
 
 setInterval(() => {
   for (const res of clients) {
@@ -491,8 +728,11 @@ setInterval(() => {
 
 server.listen(PORT, BIND, () => {
   console.log(`HERMES factory  ->  http://${BIND}:${PORT}`)
-  console.log(DEMO ? 'mode: demo (synthetic events)' : `mode: live (upstream ${OPENCODE})`)
+  if (DEMO) console.log('mode: demo (synthetic events)')
+  else if (SOURCE === 'db') console.log('mode: live (opencode.db event log)')
+  else console.log(`mode: live (upstream ${OPENCODE})`)
 })
 
 if (DEMO) startDemo()
+else if (SOURCE === 'db') startDbSource()
 else upstreamLoop()
