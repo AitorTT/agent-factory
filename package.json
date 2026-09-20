@@ -1,0 +1,11 @@
+{
+  "name": "hermes-factory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal isometric factory visualization for OpenCode agent sessions",
+  "scripts": {
+    "start": "node server.mjs",
+    "demo": "node server.mjs --demo"
+  }
+}
