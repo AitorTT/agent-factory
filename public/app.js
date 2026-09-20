@@ -12,16 +12,18 @@ const N = 13
 const TW = 64
 const TH = 32
 const CENTER_Y = (N * TH) / 2
-const SLOTS = [
-  [0, 0], [-1, 0], [1, 0], [0, -1], [0, 1],
-  [-1, -1], [1, -1], [-1, 1], [1, 1],
-  [-2, 0], [2, 0], [0, -2], [0, 2], [-2, -1], [2, 1],
-]
+const SLOTS = [[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [1, -1], [-1, 1], [1, 1]]
 const STATE_COLOR = { working: '#58d68d', waiting: '#f4c542', error: '#ef5350', idle: '#8492a6' }
-const HUD = { x: 20, y: 20, w: 330, h: 108 }
-const ROW_H = 28
+const THEMES = [
+  { id: 'factory', label: 'FACTORY' },
+  { id: 'space', label: 'SPACE' },
+]
+const HUD_H = 146
+const ROW_H = 36
 const LIST_PAD = 8
 const HEADER_H = 16
+const HERO_HEADER_H = 40
+const WIDE_MIN = 820
 
 const canvas = document.getElementById('c')
 const ctx = canvas.getContext('2d')
@@ -39,9 +41,17 @@ let upstreamHost = ''
 let dataSource = ''
 let demo = false
 let connected = false
-let lastTargets = new Map()
 let recent = []
-let sessionRows = []
+let themeButtons = []
+let stackRows = []
+let heroButtons = {}
+let hoverFolder = null
+let hoverTheme = null
+let hoverRow = null
+let hudRect = { x: 20, y: 20, w: 330, h: HUD_H }
+let stackRect = { x: 20, y: 0, w: 330, h: 0 }
+let heroRect = { x: 0, y: 0, w: 0, h: 0 }
+let focusId = null
 let enabled = loadEnabled()
 let theme = typeof location !== 'undefined' && new URLSearchParams(location.search).get('theme') === 'space' ? 'space' : 'factory'
 
@@ -70,13 +80,17 @@ function isEnabled(id) {
   return enabled[id] !== false
 }
 
-function toggleSession(id) {
-  enabled[id] = !isEnabled(id)
+function setEnabled(id, value) {
+  enabled[id] = value
   try {
     window.localStorage.setItem('agent-factory:enabled', JSON.stringify(enabled))
   } catch {
     /* ignore storage failures */
   }
+}
+
+function toggleSession(id) {
+  setEnabled(id, !isEnabled(id))
 }
 
 function setEnabledFrom(list) {
@@ -89,35 +103,61 @@ function visibleWorkers() {
   return out
 }
 
-function listHeight() {
-  return recent.length ? LIST_PAD * 2 + HEADER_H + recent.length * ROW_H : 0
+function focusedWorker() {
+  const list = visibleWorkers()
+  if (!list.length) return null
+  if (focusId) {
+    const pinned = list.find((worker) => worker.id === focusId)
+    if (pinned) return pinned
+  }
+  return list.reduce((best, worker) => ((worker.updated || 0) > (best.updated || 0) ? worker : best), list[0])
 }
 
-function listTop() {
-  return HUD.y + HUD.h + 8
-}
-
-function topPadding() {
-  return listTop() + listHeight() + 24
+function stackWorkers() {
+  return [...workers.values()].sort((a, b) => (b.updated || 0) - (a.updated || 0))
 }
 
 function iso(tx, ty) {
   return { x: ((tx - ty) * TW) / 2, y: ((tx + ty) * TH) / 2 }
 }
 
+function computeRegions() {
+  const wide = W >= WIDE_MIN
+  const leftX = wide ? 20 : 10
+  const leftW = wide ? 330 : Math.max(200, W - 20)
+  hudRect = { x: leftX, y: 20, w: leftW, h: HUD_H }
+  const maxRows = wide ? Math.max(1, Math.min(9, Math.floor((H - hudRect.y - hudRect.h - 40) / ROW_H))) : 4
+  const rows = Math.min(stackWorkers().length, maxRows)
+  const stackTop = hudRect.y + hudRect.h + 8
+  stackRect = {
+    x: leftX,
+    y: stackTop,
+    w: leftW,
+    h: rows ? LIST_PAD * 2 + HEADER_H + rows * ROW_H : 0,
+  }
+  if (wide) {
+    const hx = leftX + leftW + 16
+    heroRect = { x: hx, y: 16, w: Math.max(80, W - hx - 16), h: Math.max(120, H - 32) }
+  } else {
+    const hy = stackRect.y + stackRect.h + 8
+    heroRect = { x: 10, y: hy, w: Math.max(80, W - 20), h: Math.max(120, H - hy - 10) }
+  }
+}
+
 function layout() {
+  computeRegions()
   if (theme === 'space' && typeof spaceLayout === 'function') {
     spaceLayout()
     return
   }
-  const padX = 70
-  const padTop = topPadding()
-  const padBottom = 70
-  const availW = Math.max(60, W - padX * 2)
-  const availH = Math.max(60, H - padTop - padBottom)
+  const padX = 50
+  const padTop = HERO_HEADER_H + 24
+  const padBottom = 44
+  const availW = Math.max(40, heroRect.w - padX * 2)
+  const availH = Math.max(40, heroRect.h - padTop - padBottom)
   scale = Math.min(availW / (N * TW), availH / (N * TH)) * zoom
-  originX = W / 2
-  originY = padTop + availH / 2
+  originX = heroRect.x + heroRect.w / 2
+  originY = heroRect.y + padTop + availH / 2
 }
 
 function resize() {
@@ -151,6 +191,10 @@ function rr(x, y, w, h, r) {
   ctx.closePath()
 }
 
+function insideRect(rect, x, y) {
+  return rect && x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h
+}
+
 function diamond(point, halfW, halfH) {
   const p = toScreen(point)
   const hw = halfW * scale
@@ -162,25 +206,6 @@ function diamond(point, halfW, halfH) {
   ctx.lineTo(p.x - hw, p.y)
   ctx.closePath()
   return { x: p.x, y: p.y, hw, hh }
-}
-
-function computeTargets() {
-  const byZone = new Map()
-  for (const worker of visibleWorkers()) {
-    if (!byZone.has(worker.zone)) byZone.set(worker.zone, [])
-    byZone.get(worker.zone).push(worker.id)
-  }
-  const targets = new Map()
-  for (const [zone, ids] of byZone) {
-    ids.sort()
-    const anchor = ZONES[zone] || ZONES.breakroom
-    ids.forEach((id, index) => {
-      const slot = SLOTS[index % SLOTS.length]
-      const ring = Math.floor(index / SLOTS.length) * 0.7
-      targets.set(id, iso(anchor.tx + slot[0] * (1 + ring), anchor.ty + slot[1] * (1 + ring)))
-    })
-  }
-  return targets
 }
 
 function syncWorkers(list) {
@@ -199,23 +224,21 @@ function update(dt, now) {
     spaceUpdate(dt, now)
     return
   }
-  const targets = computeTargets()
-  lastTargets = targets
+  const worker = focusedWorker()
+  if (!worker) return
+  const anchor = ZONES[worker.zone] || ZONES.breakroom
+  const target = iso(anchor.tx, anchor.ty)
   const k = 1 - Math.exp(-6 * dt)
-  for (const worker of visibleWorkers()) {
-    const target = targets.get(worker.id)
-    if (!target) continue
-    if (!worker.placed) {
-      worker.rx = target.x
-      worker.ry = target.y
-      worker.placed = true
-    } else {
-      worker.rx += (target.x - worker.rx) * k
-      worker.ry += (target.y - worker.ry) * k
-    }
-    worker.moving = Math.hypot(target.x - worker.rx, target.y - worker.ry) > 2
-    worker.phase = hash(worker.id)
+  if (!worker.placed) {
+    worker.rx = target.x
+    worker.ry = target.y
+    worker.placed = true
+  } else {
+    worker.rx += (target.x - worker.rx) * k
+    worker.ry += (target.y - worker.ry) * k
   }
+  worker.moving = Math.hypot(target.x - worker.rx, target.y - worker.ry) > 2
+  worker.phase = hash(worker.id)
 }
 
 function drawFloor() {
@@ -233,7 +256,7 @@ function drawFloor() {
   }
 }
 
-function drawZones() {
+function drawZones(worker) {
   for (const zone of Object.values(ZONES)) {
     for (let dx = -1; dx <= 1; dx += 1) {
       for (let dy = -1; dy <= 1; dy += 1) {
@@ -249,43 +272,25 @@ function drawZones() {
         void d
       }
     }
+    const active = worker && worker.zone === Object.keys(ZONES).find((key) => ZONES[key] === zone)
     const d = diamond(iso(zone.tx, zone.ty), TW / 2 - 3, TH / 2 - 3)
-    ctx.fillStyle = zone.color + '33'
+    ctx.fillStyle = active ? zone.color + '55' : zone.color + '22'
     ctx.fill()
-    ctx.strokeStyle = zone.color + '99'
-    ctx.lineWidth = 2
+    ctx.strokeStyle = active ? zone.color : zone.color + '88'
+    ctx.lineWidth = active ? 3 : 2
     ctx.stroke()
 
     ctx.font = '600 12px ui-monospace, Menlo, Consolas, monospace'
     ctx.textAlign = 'center'
     ctx.textBaseline = 'bottom'
-    ctx.fillStyle = zone.color
+    ctx.fillStyle = active ? zone.color : zone.color + 'cc'
     ctx.fillText(zone.label, d.x, d.y - d.hh - 8)
   }
 }
 
-function drawLinks() {
-  ctx.save()
-  ctx.setLineDash([5, 6])
-  ctx.lineWidth = 1.5
-  for (const worker of visibleWorkers()) {
-    if (!worker.parentID) continue
-    const parent = workers.get(worker.parentID)
-    if (!parent || !isEnabled(parent.id)) continue
-    const a = toScreen({ x: parent.rx, y: parent.ry })
-    const b = toScreen({ x: worker.rx, y: worker.ry })
-    ctx.strokeStyle = 'rgba(120,150,200,0.35)'
-    ctx.beginPath()
-    ctx.moveTo(a.x, a.y)
-    ctx.lineTo(b.x, b.y)
-    ctx.stroke()
-  }
-  ctx.restore()
-}
-
 function drawWorker(worker, now) {
   const point = toScreen({ x: worker.rx, y: worker.ry })
-  const s = Math.max(0.75, Math.min(2.1, scale))
+  const s = Math.max(1.1, Math.min(3.4, scale))
   const color = STATE_COLOR[worker.state] || STATE_COLOR.idle
   const bob = worker.moving ? Math.sin(now / 90 + worker.phase * 6.28) * 2 * s : 0
 
@@ -336,7 +341,7 @@ function drawWorker(worker, now) {
 
   ctx.textAlign = 'center'
   ctx.textBaseline = 'bottom'
-  ctx.font = '600 12px ui-monospace, Menlo, Consolas, monospace'
+  ctx.font = '600 13px ui-monospace, Menlo, Consolas, monospace'
   ctx.fillStyle = 'rgba(230,238,248,0.92)'
   ctx.fillText(worker.title || worker.id.slice(-6), point.x, headY - 12 * s)
 
@@ -344,13 +349,25 @@ function drawWorker(worker, now) {
   if (detail) {
     ctx.font = '11px ui-monospace, Menlo, Consolas, monospace'
     ctx.fillStyle = color
-    ctx.fillText(detail.slice(0, 26), point.x, headY - 1 * s)
+    ctx.fillText(detail.slice(0, 34), point.x, headY - 1 * s)
   }
 }
 
-function drawWorkers(now) {
-  const list = visibleWorkers().sort((a, b) => a.ry - b.ry)
-  for (const worker of list) drawWorker(worker, now)
+function drawLegend(worker) {
+  const zoneNames = Object.keys(ZONES)
+  const y = heroRect.y + heroRect.h - 14 - Math.ceil(zoneNames.length / 2) * 18
+  zoneNames.forEach((name, index) => {
+    const col = index % 2
+    const row = Math.floor(index / 2)
+    const x = heroRect.x + 14 + col * 168
+    const yy = y + row * 18
+    const active = worker && worker.zone === name
+    ctx.fillStyle = active ? ZONES[name].color : ZONES[name].color + '99'
+    ctx.fillRect(x, yy - 5, 10, 10)
+    ctx.fillStyle = active ? '#e6eef8' : '#94a3b8'
+    ctx.font = `${active ? '600 ' : ''}12px ui-monospace, Menlo, Consolas, monospace`
+    ctx.fillText(ZONES[name].label, x + 18, yy)
+  })
 }
 
 function formatTokens(value) {
@@ -359,13 +376,13 @@ function formatTokens(value) {
   return String(value)
 }
 
-function drawHud(now, options = {}) {
+function drawHud(now) {
   ctx.save()
   ctx.textAlign = 'left'
   ctx.textBaseline = 'middle'
 
-  rr(HUD.x, HUD.y, HUD.w, HUD.h, 12)
-  ctx.fillStyle = 'rgba(14,18,26,0.82)'
+  rr(hudRect.x, hudRect.y, hudRect.w, hudRect.h, 12)
+  ctx.fillStyle = 'rgba(14,18,26,0.86)'
   ctx.fill()
   ctx.strokeStyle = 'rgba(120,150,200,0.18)'
   ctx.lineWidth = 1
@@ -373,88 +390,51 @@ function drawHud(now, options = {}) {
 
   ctx.fillStyle = '#e6eef8'
   ctx.font = '700 18px ui-monospace, Menlo, Consolas, monospace'
-  ctx.fillText('HERMES FACTORY', HUD.x + 18, HUD.y + 24)
+  ctx.fillText('HERMES FACTORY', hudRect.x + 18, hudRect.y + 24)
 
   const live = upstream === 'connected'
   const dotColor = demo ? '#5aa9e6' : live ? '#58d68d' : '#ef5350'
   ctx.fillStyle = dotColor
   ctx.beginPath()
-  ctx.arc(HUD.x + HUD.w - 24, HUD.y + 24, 5, 0, Math.PI * 2)
+  ctx.arc(hudRect.x + hudRect.w - 24, hudRect.y + 24, 5, 0, Math.PI * 2)
   ctx.fill()
 
   ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'
   ctx.fillStyle = '#8492a6'
-  const statusText = demo ? 'demo stream' : live ? `live · ${dataSource || 'sse'}` : 'upstream offline'
-  ctx.fillText(statusText, HUD.x + 18, HUD.y + 46)
+  ctx.fillText(demo ? 'demo stream' : live ? `live · ${dataSource || 'sse'}` : 'upstream offline', hudRect.x + 18, hudRect.y + 46)
 
   ctx.font = '13px ui-monospace, Menlo, Consolas, monospace'
   ctx.fillStyle = '#cbd5e1'
   ctx.fillText(
     `agents ${stats.sessions}   working ${stats.working}   waiting ${stats.waiting}   error ${stats.error}`,
-    HUD.x + 18,
-    HUD.y + 70,
+    hudRect.x + 18,
+    hudRect.y + 70,
   )
   ctx.fillStyle = '#7f8fa6'
-  ctx.fillText(`tokens ${formatTokens(stats.tokens)}   cost $${(stats.cost || 0).toFixed(3)}`, HUD.x + 18, HUD.y + 90)
+  ctx.fillText(`tokens ${formatTokens(stats.tokens)}   cost $${(stats.cost || 0).toFixed(3)}`, hudRect.x + 18, hudRect.y + 90)
 
-  if (options.legend !== false) {
-    const zoneNames = Object.keys(ZONES)
-    const counts = new Map()
-    for (const worker of visibleWorkers()) counts.set(worker.zone, (counts.get(worker.zone) || 0) + 1)
-    const baseY = H - 30 - Math.ceil(zoneNames.length / 2) * 20
-    zoneNames.forEach((name, index) => {
-      const col = index % 2
-      const row = Math.floor(index / 2)
-      const x = 24 + col * 210
-      const y = baseY + row * 20
-      ctx.fillStyle = ZONES[name].color
-      ctx.fillRect(x, y - 5, 10, 10)
-      ctx.fillStyle = '#94a3b8'
-      ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'
-      ctx.fillText(`${ZONES[name].label}  ${counts.get(name) || 0}`, x + 18, y)
-    })
-  }
-
-  if (!workers.size) {
+  themeButtons = []
+  const buttonW = (hudRect.w - 36 - 8) / 2
+  const buttonY = hudRect.y + hudRect.h - 34
+  THEMES.forEach((item, index) => {
+    const bx = hudRect.x + 18 + index * (buttonW + 8)
+    const active = theme === item.id
+    const hot = hoverTheme === item.id
+    rr(bx, buttonY, buttonW, 26, 6)
+    ctx.fillStyle = active ? 'rgba(90,169,230,0.3)' : hot ? 'rgba(120,150,200,0.16)' : 'rgba(120,150,200,0.08)'
+    ctx.fill()
+    ctx.strokeStyle = active ? 'rgba(120,190,255,0.75)' : 'rgba(120,150,200,0.22)'
+    ctx.lineWidth = 1
+    ctx.stroke()
+    ctx.font = '600 11px ui-monospace, Menlo, Consolas, monospace'
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
-    const fullHost = upstreamHost || 'http://127.0.0.1:4096'
-    const bareHost = fullHost.replace(/^https?:\/\//, '')
-    const dbSource = dataSource === 'db'
-    const title = demo
-      ? 'starting demo...'
-      : upstream !== 'connected'
-        ? dbSource
-          ? 'cannot read opencode.db'
-          : `upstream unreachable: ${bareHost}`
-        : dbSource
-          ? 'no recent agent activity'
-          : `no active sessions on ${bareHost}`
-    ctx.fillStyle = 'rgba(148,163,184,0.8)'
-    ctx.font = '600 20px ui-monospace, Menlo, Consolas, monospace'
-    ctx.fillText(title, W / 2, H / 2 - 16)
-    if (!demo) {
-      ctx.fillStyle = 'rgba(120,150,200,0.9)'
-      ctx.font = '15px ui-monospace, Menlo, Consolas, monospace'
-      ctx.fillText(dbSource ? 'watching opencode.db for any agent activity' : `run:  opencode attach ${fullHost}`, W / 2, H / 2 + 18)
-      ctx.fillStyle = 'rgba(107,122,143,0.75)'
-      ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'
-      ctx.fillText(
-        dbSource ? 'start a session anywhere - desktop app, TUI, or server' : 'sessions must run against this server to appear here',
-        W / 2,
-        H / 2 + 44,
-      )
-    }
-  } else if (!visibleWorkers().length) {
-    ctx.textAlign = 'center'
+    ctx.fillStyle = active ? '#cfe6ff' : 'rgba(150,170,195,0.9)'
+    ctx.fillText(item.label, bx + buttonW / 2, buttonY + 13)
+    ctx.textAlign = 'left'
     ctx.textBaseline = 'middle'
-    ctx.fillStyle = 'rgba(148,163,184,0.75)'
-    ctx.font = '600 18px ui-monospace, Menlo, Consolas, monospace'
-    ctx.fillText('all sessions hidden', W / 2, H / 2 - 10)
-    ctx.fillStyle = 'rgba(107,122,143,0.75)'
-    ctx.font = '13px ui-monospace, Menlo, Consolas, monospace'
-    ctx.fillText('toggle a session on in the list at the top left', W / 2, H / 2 + 16)
-  }
+    themeButtons.push({ id: item.id, x: bx, y: buttonY, w: buttonW, h: 26 })
+  })
   ctx.restore()
   void now
 }
@@ -474,15 +454,15 @@ function agoText(updated) {
   return `${Math.round(hours / 24)}d`
 }
 
-function drawSessionList() {
-  sessionRows = []
-  if (!recent.length) return
-  const x = HUD.x
-  const y = listTop()
-  const w = HUD.w
-  const h = listHeight()
-  rr(x, y, w, h, 12)
-  ctx.fillStyle = 'rgba(14,18,26,0.82)'
+function drawStack(now) {
+  stackRows = []
+  if (!stackRect.h) return
+  const focus = focusedWorker()
+  const list = stackWorkers()
+  const rows = Math.floor((stackRect.h - LIST_PAD * 2 - HEADER_H) / ROW_H)
+
+  rr(stackRect.x, stackRect.y, stackRect.w, stackRect.h, 12)
+  ctx.fillStyle = 'rgba(14,18,26,0.86)'
   ctx.fill()
   ctx.strokeStyle = 'rgba(120,150,200,0.18)'
   ctx.lineWidth = 1
@@ -492,58 +472,225 @@ function drawSessionList() {
   ctx.textBaseline = 'middle'
   ctx.font = '600 10px ui-monospace, Menlo, Consolas, monospace'
   ctx.fillStyle = 'rgba(120,150,200,0.7)'
-  ctx.fillText('RECENT SESSIONS', x + 14, y + LIST_PAD + HEADER_H / 2)
+  ctx.fillText('SESSIONS', stackRect.x + 14, stackRect.y + LIST_PAD + HEADER_H / 2)
 
-  recent.forEach((session, index) => {
-    const rowY = y + LIST_PAD + HEADER_H + index * ROW_H
-    sessionRows.push({ id: session.id, x, y: rowY, w, h: ROW_H })
+  list.slice(0, rows).forEach((session, index) => {
+    const rowY = stackRect.y + LIST_PAD + HEADER_H + index * ROW_H
+    const rowRect = { x: stackRect.x + 6, y: rowY + 2, w: stackRect.w - 12, h: ROW_H - 4 }
+    const toggle = { x: stackRect.x + 14, y: rowY + ROW_H / 2 - 7, w: 28, h: 14 }
+    const folder = { x: stackRect.x + stackRect.w - 32, y: rowY + ROW_H / 2 - 10, w: 22, h: 20 }
+    stackRows.push({ id: session.id, rect: rowRect, toggle, folder })
+
     const on = isEnabled(session.id)
+    const isFocus = focus && focus.id === session.id
     const cy = rowY + ROW_H / 2
+    const hot = hoverRow === session.id || hoverFolder === session.id
 
-    rr(x + 14, cy - 7, 28, 14, 7)
+    rr(rowRect.x, rowRect.y, rowRect.w, rowRect.h, 8)
+    ctx.fillStyle = isFocus ? 'rgba(90,169,230,0.16)' : hot ? 'rgba(120,150,200,0.1)' : 'rgba(255,255,255,0.02)'
+    ctx.fill()
+    if (isFocus) {
+      ctx.strokeStyle = 'rgba(120,190,255,0.6)'
+      ctx.lineWidth = 1
+      ctx.stroke()
+      ctx.fillStyle = '#5aa9e6'
+      ctx.fillRect(rowRect.x + 1, rowRect.y + 6, 3, rowRect.h - 12)
+    }
+
+    rr(toggle.x, toggle.y, toggle.w, toggle.h, 7)
     ctx.fillStyle = on ? 'rgba(88,214,141,0.28)' : 'rgba(120,135,155,0.18)'
     ctx.fill()
     ctx.beginPath()
-    ctx.arc(on ? x + 35 : x + 21, cy, 8, 0, Math.PI * 2)
+    ctx.arc(on ? toggle.x + 21 : toggle.x + 7, toggle.y + 7, 6, 0, Math.PI * 2)
     ctx.fillStyle = on ? '#58d68d' : '#7f8c9b'
     ctx.fill()
 
-    ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'
-    ctx.fillStyle = on ? '#cbd5e1' : '#5f6b7c'
-    ctx.fillText(shortTitle(session.title || session.id.slice(-6), 28), x + 52, cy - 6)
+    ctx.font = `${isFocus ? '700 ' : ''}12px ui-monospace, Menlo, Consolas, monospace`
+    ctx.fillStyle = on ? '#dbe6f3' : '#5f6b7c'
+    ctx.fillText(shortTitle(session.title || session.id.slice(-6), 25), stackRect.x + 52, cy - 6)
 
     ctx.font = '10px ui-monospace, Menlo, Consolas, monospace'
     ctx.fillStyle = on ? 'rgba(132,146,166,0.95)' : 'rgba(95,107,124,0.8)'
-    ctx.fillText(shortTitle(session.dir || '—', 18), x + 52, cy + 8)
+    const detail = session.tool ? `${session.tool}${session.file ? ' · ' + session.file : ''}` : session.dir || '—'
+    ctx.fillText(shortTitle(detail, 20), stackRect.x + 52, cy + 8)
 
     ctx.beginPath()
-    ctx.arc(x + w - 44, cy, 3, 0, Math.PI * 2)
+    ctx.arc(stackRect.x + stackRect.w - 46, cy, 3, 0, Math.PI * 2)
     ctx.fillStyle = STATE_COLOR[session.state] || STATE_COLOR.idle
     ctx.fill()
 
     ctx.textAlign = 'right'
     ctx.fillStyle = on ? 'rgba(132,146,166,0.9)' : 'rgba(95,107,124,0.75)'
-    ctx.fillText(agoText(session.updated), x + w - 14, cy)
+    ctx.fillText(agoText(session.updated), stackRect.x + stackRect.w - 54, cy)
     ctx.textAlign = 'left'
+
+    const fhot = hoverFolder === session.id
+    rr(folder.x, folder.y, folder.w, folder.h, 5)
+    ctx.fillStyle = fhot ? 'rgba(90,169,230,0.28)' : 'rgba(120,150,200,0.1)'
+    ctx.fill()
+    ctx.strokeStyle = fhot ? 'rgba(120,190,255,0.7)' : 'rgba(120,150,200,0.24)'
+    ctx.lineWidth = 1
+    ctx.stroke()
+    const fx = folder.x + 5
+    const fy = folder.y + 6
+    ctx.fillStyle = fhot ? '#9fd0ff' : 'rgba(150,175,205,0.8)'
+    ctx.fillRect(fx, fy, 6, 2.5)
+    rr(fx, fy + 2, 12, 8, 1.5)
+    ctx.fill()
   })
+  void now
 }
 
-function draw(now) {
-  if (theme === 'space' && typeof spaceDraw === 'function') {
-    spaceDraw(now)
-    return
-  }
+function drawHeroHeader(worker) {
+  heroButtons = {}
+  if (!worker) return
+  const hx = heroRect.x + 1
+  const hy = heroRect.y + 1
+  const hw = heroRect.w - 2
+  const color = STATE_COLOR[worker.state] || STATE_COLOR.idle
+
+  ctx.save()
+  rr(hx, hy, hw, HERO_HEADER_H, 12)
+  ctx.clip()
+  ctx.fillStyle = 'rgba(10,13,22,0.82)'
+  ctx.fillRect(hx, hy, hw, HERO_HEADER_H)
+  ctx.restore()
+
+  ctx.textAlign = 'left'
+  ctx.textBaseline = 'middle'
+  ctx.font = '700 15px ui-monospace, Menlo, Consolas, monospace'
+  ctx.fillStyle = '#e6eef8'
+  ctx.fillText(worker.title || worker.id.slice(-6), hx + 14, hy + 15)
+
+  ctx.font = '11px ui-monospace, Menlo, Consolas, monospace'
+  ctx.fillStyle = 'rgba(140,160,185,0.95)'
+  const info = [worker.dir || '—', worker.state, worker.tool].filter(Boolean).join(' · ')
+  ctx.fillText(shortTitle(info, 52), hx + 14, hy + 30)
+
+  ctx.beginPath()
+  ctx.arc(hx + 8, hy + 30, 3, 0, Math.PI * 2)
+  ctx.fillStyle = color
+  ctx.fill()
+
+  let bx = hx + hw - 12
+  const autoRect = { x: bx - 52, y: hy + 10, w: 52, h: 20 }
+  bx -= 58
+  const folderRect = { x: bx - 26, y: hy + 10, w: 26, h: 20 }
+  bx -= 32
+  const toggleRect = { x: bx - 30, y: hy + 11, w: 30, h: 18 }
+
+  const pinned = Boolean(focusId)
+  rr(autoRect.x, autoRect.y, autoRect.w, autoRect.h, 6)
+  ctx.fillStyle = pinned ? 'rgba(120,150,200,0.1)' : 'rgba(90,169,230,0.28)'
+  ctx.fill()
+  ctx.strokeStyle = pinned ? 'rgba(120,150,200,0.25)' : 'rgba(120,190,255,0.7)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+  ctx.font = '600 10px ui-monospace, Menlo, Consolas, monospace'
+  ctx.textAlign = 'center'
+  ctx.fillStyle = pinned ? 'rgba(150,170,195,0.9)' : '#cfe6ff'
+  ctx.fillText(pinned ? 'PINNED' : 'AUTO', autoRect.x + autoRect.w / 2, autoRect.y + 10)
+
+  const fhot = hoverFolder === '__hero__'
+  rr(folderRect.x, folderRect.y, folderRect.w, folderRect.h, 5)
+  ctx.fillStyle = fhot ? 'rgba(90,169,230,0.28)' : 'rgba(120,150,200,0.1)'
+  ctx.fill()
+  ctx.strokeStyle = fhot ? 'rgba(120,190,255,0.7)' : 'rgba(120,150,200,0.24)'
+  ctx.stroke()
+  ctx.fillStyle = fhot ? '#9fd0ff' : 'rgba(150,175,205,0.8)'
+  ctx.fillRect(folderRect.x + 6, folderRect.y + 6, 6, 2.5)
+  rr(folderRect.x + 6, folderRect.y + 8, 14, 9, 1.5)
+  ctx.fill()
+
+  const on = isEnabled(worker.id)
+  rr(toggleRect.x, toggleRect.y, toggleRect.w, toggleRect.h, 9)
+  ctx.fillStyle = on ? 'rgba(88,214,141,0.28)' : 'rgba(120,135,155,0.18)'
+  ctx.fill()
+  ctx.beginPath()
+  ctx.arc(on ? toggleRect.x + 21 : toggleRect.x + 9, toggleRect.y + 9, 7, 0, Math.PI * 2)
+  ctx.fillStyle = on ? '#58d68d' : '#7f8c9b'
+  ctx.fill()
+
+  ctx.textAlign = 'left'
+  heroButtons = { auto: autoRect, folder: folderRect, toggle: toggleRect }
+}
+
+function drawEmptyState() {
+  if (workers.size && visibleWorkers().length) return
+  const cx = heroRect.x + heroRect.w / 2
+  const cy = heroRect.y + heroRect.h / 2
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  const fullHost = upstreamHost || 'http://127.0.0.1:4096'
+  const bareHost = fullHost.replace(/^https?:\/\//, '')
+  const dbSource = dataSource === 'db'
+  const noWorkers = !workers.size
+  const title = demo
+    ? 'starting demo...'
+    : noWorkers
+      ? upstream !== 'connected'
+        ? dbSource
+          ? 'cannot read opencode.db'
+          : `upstream unreachable: ${bareHost}`
+        : dbSource
+          ? 'no recent agent activity'
+          : `no active sessions on ${bareHost}`
+      : 'all sessions hidden'
+  ctx.fillStyle = 'rgba(148,163,184,0.8)'
+  ctx.font = '600 20px ui-monospace, Menlo, Consolas, monospace'
+  ctx.fillText(title, cx, cy - 16)
+  ctx.fillStyle = 'rgba(120,150,200,0.9)'
+  ctx.font = '14px ui-monospace, Menlo, Consolas, monospace'
+  if (demo) return
+  ctx.fillText(
+    noWorkers
+      ? dbSource
+        ? 'watching opencode.db for any agent activity'
+        : `run:  opencode attach ${fullHost}`
+      : 'toggle a session on in the list at the top left',
+    cx,
+    cy + 16,
+  )
+}
+
+function drawBg() {
   const gradient = ctx.createLinearGradient(0, 0, 0, H)
+  gradient.addColorStop(0, '#0b0f1a')
+  gradient.addColorStop(1, '#06080e')
+  ctx.fillStyle = gradient
+  ctx.fillRect(0, 0, W, H)
+}
+
+function drawFactoryHero(now) {
+  const worker = focusedWorker()
+  ctx.save()
+  rr(heroRect.x, heroRect.y, heroRect.w, heroRect.h, 12)
+  ctx.clip()
+  const gradient = ctx.createLinearGradient(0, heroRect.y, 0, heroRect.y + heroRect.h)
   gradient.addColorStop(0, '#0d1220')
   gradient.addColorStop(1, '#080a10')
   ctx.fillStyle = gradient
-  ctx.fillRect(0, 0, W, H)
+  ctx.fillRect(heroRect.x, heroRect.y, heroRect.w, heroRect.h)
   drawFloor()
-  drawZones()
-  drawLinks()
-  drawWorkers(now)
+  drawZones(worker)
+  if (worker) drawWorker(worker, now)
+  drawLegend(worker)
+  ctx.restore()
+  rr(heroRect.x, heroRect.y, heroRect.w, heroRect.h, 12)
+  ctx.strokeStyle = 'rgba(120,150,200,0.18)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+}
+
+function draw(now) {
+  computeRegions()
+  drawBg()
+  if (theme === 'space' && typeof spaceDraw === 'function') spaceDraw(now)
+  else drawFactoryHero(now)
+  drawHeroHeader(focusedWorker())
   drawHud(now)
-  drawSessionList()
+  drawStack(now)
+  drawEmptyState()
 }
 
 let last = performance.now()
@@ -568,18 +715,29 @@ function connect() {
       dataSource = message.source || ''
       demo = message.demo
       stats = message.stats
-      const nextRecent = message.recent || []
-      if (nextRecent.length !== recent.length) {
-        recent = nextRecent
-        layout()
-      } else {
-        recent = nextRecent
-      }
+      recent = message.recent || []
       syncWorkers(message.workers)
     } catch {
       /* ignore malformed frames */
     }
   }
+}
+
+function openFolder(id) {
+  try {
+    fetch('/api/open-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    })
+  } catch {
+    /* ignore */
+  }
+}
+
+function focusSession(id) {
+  focusId = id
+  if (!isEnabled(id)) setEnabled(id, true)
 }
 
 window.addEventListener('resize', resize)
@@ -600,18 +758,79 @@ function handleClick(event) {
   const rect = canvas.getBoundingClientRect()
   const x = event.clientX - rect.left
   const y = event.clientY - rect.top
-  for (const row of sessionRows) {
-    if (x >= row.x && x <= row.x + row.w && y >= row.y && y <= row.y + row.h) {
+  for (const button of themeButtons) {
+    if (insideRect(button, x, y)) {
+      setTheme(button.id)
+      return
+    }
+  }
+  if (insideRect(heroButtons.toggle, x, y)) {
+    const worker = focusedWorker()
+    if (worker) toggleSession(worker.id)
+    return
+  }
+  if (insideRect(heroButtons.folder, x, y)) {
+    const worker = focusedWorker()
+    if (worker) openFolder(worker.id)
+    return
+  }
+  if (insideRect(heroButtons.auto, x, y)) {
+    focusId = focusId ? null : (focusedWorker() ? focusedWorker().id : null)
+    return
+  }
+  for (const row of stackRows) {
+    if (insideRect(row.folder, x, y)) {
+      openFolder(row.id)
+      return
+    }
+  }
+  for (const row of stackRows) {
+    if (insideRect(row.toggle, x, y)) {
       toggleSession(row.id)
+      return
+    }
+  }
+  for (const row of stackRows) {
+    if (insideRect(row.rect, x, y)) {
+      focusSession(row.id)
       return
     }
   }
 }
 
+function handleMove(event) {
+  const rect = canvas.getBoundingClientRect()
+  const x = event.clientX - rect.left
+  const y = event.clientY - rect.top
+  let folderHot = null
+  for (const row of stackRows) {
+    if (insideRect(row.folder, x, y)) { folderHot = row.id; break }
+  }
+  if (insideRect(heroButtons.folder, x, y)) folderHot = '__hero__'
+  hoverFolder = folderHot
+
+  let rowHot = null
+  for (const row of stackRows) {
+    if (insideRect(row.rect, x, y) && !insideRect(row.folder, x, y) && !insideRect(row.toggle, x, y)) { rowHot = row.id; break }
+  }
+  hoverRow = rowHot
+
+  let themeHot = null
+  for (const button of themeButtons) {
+    if (insideRect(button, x, y)) { themeHot = button.id; break }
+  }
+  hoverTheme = themeHot
+
+  const overHeroButton = insideRect(heroButtons.auto, x, y) || insideRect(heroButtons.toggle, x, y) || insideRect(heroButtons.folder, x, y)
+  const pointer = folderHot || rowHot || themeHot || overHeroButton
+  if (canvas.style) canvas.style.cursor = pointer ? 'pointer' : 'default'
+}
+
 canvas.addEventListener('click', handleClick)
+canvas.addEventListener('mousemove', handleMove)
 
 resize()
 connect()
 requestAnimationFrame(frame)
-void lastTargets
+void recent
 void connected

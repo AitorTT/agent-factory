@@ -1,5 +1,7 @@
 import http from 'node:http'
 import os from 'node:os'
+import { spawn } from 'node:child_process'
+import { statSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -87,6 +89,7 @@ function upsertSession(info) {
   worker.lastActivity = Math.max(worker.lastActivity || 0, stamp)
   if (info.title) worker.title = short(info.title)
   worker.dir = baseName(info.directory)
+  if (info.directory) worker.directory = info.directory
   if (info.parentID) worker.parentID = info.parentID
   markDirty()
   return worker
@@ -314,6 +317,7 @@ function snapshot() {
       tokens: worker.tokens || 0,
       cost: Number((worker.cost || 0).toFixed(4)),
       note: worker.note || null,
+      updated: worker.lastActivity || 0,
     })),
     stats: computeStats(),
   })
@@ -484,8 +488,52 @@ const CONTENT_TYPES = {
   '.json': 'application/json; charset=utf-8',
 }
 
+function openFolder(target) {
+  const resolved = process.platform === 'win32' ? target.replace(/\//g, '\\') : target
+  try {
+    if (!statSync(resolved).isDirectory()) return { ok: false, error: 'not a directory' }
+  } catch {
+    return { ok: false, error: 'path not found' }
+  }
+  const command = process.platform === 'win32' ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open'
+  try {
+    const child = spawn(command, [resolved], { detached: true, stdio: 'ignore' })
+    child.unref()
+    return { ok: true, path: resolved }
+  } catch (error) {
+    return { ok: false, error: error.message }
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
+
+  if (url.pathname === '/api/open-folder') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'text/plain' })
+      res.end('method not allowed')
+      return
+    }
+    let body = ''
+    req.on('data', (chunk) => {
+      body += chunk
+      if (body.length > 8192) req.destroy()
+    })
+    req.on('end', () => {
+      let id = ''
+      try {
+        id = JSON.parse(body || '{}').id || ''
+      } catch {
+        id = ''
+      }
+      const worker = id ? workers.get(id) : null
+      const target = worker && worker.directory
+      const result = target ? openFolder(target) : { ok: false, error: 'unknown session' }
+      res.writeHead(result.ok ? 200 : 404, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify(result))
+    })
+    return
+  }
 
   if (url.pathname === '/api/events') {
     res.writeHead(200, {
