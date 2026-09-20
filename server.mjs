@@ -10,8 +10,7 @@ const BIND = process.env.BIND || '127.0.0.1'
 const OPENCODE = (process.env.OPENCODE_HOST || 'http://127.0.0.1:4096').replace(/\/+$/, '')
 const DEMO = process.argv.includes('--demo') || process.env.DEMO === '1'
 const TICK_MS = 100
-const RECENT_MS = Number(process.env.RECENT_MINUTES || 15) * 60 * 1000
-const IDLE_TTL_MS = Number(process.env.IDLE_TTL_MINUTES || 5) * 60 * 1000
+const WINDOW_MS = Number(process.env.ACTIVE_MINUTES || 15) * 60 * 1000
 const MAX_WORKERS = Number(process.env.MAX_WORKERS || 80)
 
 const TOOL_ZONE = {
@@ -58,11 +57,12 @@ function upsertSession(info) {
       note: null,
       todos: 0,
       todosDone: 0,
-      lastActivity: Date.now(),
+      lastActivity: 0,
     }
     workers.set(info.id, worker)
   }
-  worker.lastActivity = Date.now()
+  const stamp = info.time?.updated && info.time.updated > 0 ? info.time.updated : Date.now()
+  worker.lastActivity = Math.max(worker.lastActivity || 0, stamp)
   if (info.title) worker.title = short(info.title)
   worker.dir = baseName(info.directory)
   if (info.parentID) worker.parentID = info.parentID
@@ -272,7 +272,7 @@ async function reconcile() {
     for (const session of sessions) {
       const status = statusMap[session.id]
       const active = status && status.type !== 'idle'
-      const recent = (session.time?.updated || 0) > now - RECENT_MS
+      const recent = (session.time?.updated || 0) > now - WINDOW_MS
       if (!active && !recent) continue
       if (upsertSession(session)) alive.add(session.id)
     }
@@ -455,7 +455,7 @@ function reap() {
   const now = Date.now()
   let changed = false
   for (const [id, worker] of [...workers.entries()]) {
-    if (worker.state === 'idle' && now - (worker.lastActivity || 0) > IDLE_TTL_MS) {
+    if (worker.state === 'idle' && now - (worker.lastActivity || 0) > WINDOW_MS) {
       workers.delete(id)
       changed = true
     }
